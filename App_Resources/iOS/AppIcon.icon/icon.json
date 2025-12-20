@@ -1,0 +1,37 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "display-p3:0.21568,0.05831,0.04699,1.00000",
+      "display-p3:0.08006,0.23027,0.08661,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "ns-logo-white-front.png",
+          "name" : "ns-logo-white-front"
+        },
+        {
+          "hidden" : false,
+          "image-name" : "ns-log-dark-back.png",
+          "name" : "ns-log-dark-back"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
