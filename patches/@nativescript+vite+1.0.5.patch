@@ -1,0 +1,106 @@
+diff --git a/node_modules/@nativescript/vite/configuration/angular.js b/node_modules/@nativescript/vite/configuration/angular.js
+index 723c0b2..61e4097 100644
+--- a/node_modules/@nativescript/vite/configuration/angular.js
++++ b/node_modules/@nativescript/vite/configuration/angular.js
+@@ -1,5 +1,6 @@
+ import { mergeConfig } from 'vite';
+ import path from 'path';
++import fs from 'node:fs';
+ import { createRequire } from 'node:module';
+ import angular from '@analogjs/vite-plugin-angular';
+ import { angularLinkerVitePlugin, angularLinkerVitePluginPost } from '../helpers/angular/angular-linker.js';
+@@ -118,10 +119,25 @@ function angularRollupLinker(projectRoot) {
+ const cliFlags = getCliFlags();
+ const isDevEnv = process.env.NODE_ENV !== 'production';
+ const hmrActive = isDevEnv && !!cliFlags.hmr;
++
++const projectRoot = process.cwd();
++const tsConfigAppPath = path.resolve(projectRoot, 'tsconfig.app.json');
++const tsConfigPath = path.resolve(projectRoot, 'tsconfig.json');
++let tsconfig = tsConfigAppPath;
++if (!fs.existsSync(tsConfigAppPath) && fs.existsSync(tsConfigPath)) {
++    tsconfig = tsConfigPath;
++}
++
++// Track HTML template -> TS component relationships for watch mode rebuilds
++const templateToComponentMap = new Map();
++// Track which TS files need recompilation due to HTML changes
++const pendingHtmlChanges = new Set();
++
+ const plugins = [
+     // Allow external html template changes to trigger hot reload: Make .ts files depend on their .html templates
+     {
+         name: 'angular-template-deps',
++        enforce: 'pre',
+         transform(code, id) {
+             // For .ts files that reference templateUrl, add the .html file as a dependency
+             if (id.endsWith('.ts') && code.includes('templateUrl')) {
+@@ -130,10 +146,35 @@ const plugins = [
+                     const htmlPath = path.resolve(path.dirname(id), templateUrlMatch[1]);
+                     // Add the HTML file as a dependency so Vite watches it
+                     this.addWatchFile(htmlPath);
++                    // Track the relationship for build watch mode
++                    templateToComponentMap.set(htmlPath, id);
+                 }
+             }
+             return null;
+         },
++        // Handle file changes in build watch mode - queue TS files for recompilation
++        watchChange(id, change) {
++            // When an HTML template changes, mark the TS component for recompilation
++            if (id.endsWith('.html') && templateToComponentMap.has(id)) {
++                const tsPath = templateToComponentMap.get(id);
++                pendingHtmlChanges.add(tsPath);
++            }
++        },
++        // On build start, touch any TS files that had HTML changes
++        buildStart() {
++            if (pendingHtmlChanges.size > 0) {
++                const now = new Date();
++                for (const tsPath of pendingHtmlChanges) {
++                    try {
++                        // Touch the TS file to force Angular to recompile it
++                        fs.utimesSync(tsPath, now, now);
++                    } catch (e) {
++                        // Ignore errors
++                    }
++                }
++                pendingHtmlChanges.clear();
++            }
++        },
+     },
+     // Transform Angular partial declarations in node_modules to avoid runtime JIT
+     // Pass the project root so linker deps resolve from the app, not the plugin package.
+@@ -142,6 +183,7 @@ const plugins = [
+     // angularRollupLinker(process.cwd()),
+     angular({
+         liveReload: false, // Disable live reload in favor of HMR
++        tsconfig,
+     }),
+     // Post-phase linker to catch any declarations introduced after other transforms (including project code)
+     angularLinkerVitePluginPost(process.cwd()),
+diff --git a/node_modules/@nativescript/vite/configuration/base.js b/node_modules/@nativescript/vite/configuration/base.js
+index 4ba1784..e8d0940 100644
+--- a/node_modules/@nativescript/vite/configuration/base.js
++++ b/node_modules/@nativescript/vite/configuration/base.js
+@@ -452,7 +452,9 @@ export const baseConfig = ({ mode, flavor }) => {
+                         // In HMR, avoid emitting a Rollup vendor chunk on disk. The dev server
+                         // serves vendor over HTTP and we separately emit a single ns-vendor.mjs
+                         // for Android SBG to scan via the vendorManifestPlugin above.
+-                        if (hmrActive) {
++                        // Also disable chunking in dev mode to avoid circular dependency issues
++                        // with Angular decorators during incremental rebuilds.
++                        if (hmrActive || isDevMode) {
+                             return undefined;
+                         }
+                         const normalizedId = id.split('?')[0].replace(/\\/g, '/');
+@@ -462,7 +464,8 @@ export const baseConfig = ({ mode, flavor }) => {
+                         }
+                         if (id.includes('node_modules')) {
+                             // Keep common dependencies in the main bundle
+-                            if (id.includes('@angular/') || id.includes('@nativescript/angular') || id.includes('@nativescript/core')) {
++                            // tslib must stay with Angular to avoid circular dependency issues with decorators
++                            if (id.includes('@angular/') || id.includes('@nativescript/angular') || id.includes('@nativescript/core') || id.includes('/tslib/')) {
+                                 return undefined; // Keep in main bundle
+                             }
+                             return 'vendor';

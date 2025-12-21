@@ -1,0 +1,82 @@
+diff --git a/node_modules/@analogjs/vite-plugin-angular/src/lib/angular-vite-plugin.js b/node_modules/@analogjs/vite-plugin-angular/src/lib/angular-vite-plugin.js
+index acb1564..d880507 100644
+--- a/node_modules/@analogjs/vite-plugin-angular/src/lib/angular-vite-plugin.js
++++ b/node_modules/@analogjs/vite-plugin-angular/src/lib/angular-vite-plugin.js
+@@ -84,6 +84,8 @@ export function angular(options) {
+     let inlineComponentStyles;
+     let externalComponentStyles;
+     const sourceFileCache = new SourceFileCache();
++    // Track TS files that need recompilation due to HTML template changes
++    const pendingTemplateInvalidations = new Set();
+     const isTest = process.env['NODE_ENV'] === 'test' || !!process.env['VITEST'];
+     const isVitestVscode = !!process.env['VITEST_VSCODE'];
+     const isStackBlitz = !!process.versions['webcontainer'];
+@@ -190,6 +192,11 @@ export function angular(options) {
+             },
+             configResolved(config) {
+                 resolvedConfig = config;
++                // Detect build watch mode (vite build --watch)
++                // In build watch mode, we need incremental compilation like in serve mode
++                if (config.build?.watch) {
++                    watchMode = true;
++                }
+                 if (pluginOptions.useAngularCompilationAPI) {
+                     externalComponentStyles = new Map();
+                     inlineComponentStyles = new Map();
+@@ -338,6 +345,32 @@ export function angular(options) {
+                 classNames.clear();
+                 return ctx.modules;
+             },
++            // Handle file changes in build watch mode
++            watchChange(id, change) {
++                // When an HTML/CSS template changes in build watch mode, invalidate related modules
++                if (/\.(html|htm|css|less|sass|scss)$/.test(id)) {
++                    fileTransformMap.delete(id.split('?')[0]);
++                    // Find the component TS file that uses this template
++                    const templatePath = normalizePath(id.split('?')[0]);
++                    // Look through outputFiles for any component that references this template
++                    for (const [tsPath, data] of outputFiles.entries()) {
++                        if (data.dependencies && data.dependencies.includes(templatePath)) {
++                            // Invalidate the TS file's cached output
++                            outputFiles.delete(tsPath);
++                            sourceFileCache.invalidate(new Set([tsPath]));
++                            pendingTemplateInvalidations.add(tsPath);
++                        }
++                    }
++                    // Also try to find by naming convention (component.html -> component.ts)
++                    if (id.endsWith('.html')) {
++                        const basePath = id.replace(/\.html$/, '.ts');
++                        const normalizedBasePath = normalizePath(basePath);
++                        outputFiles.delete(normalizedBasePath);
++                        sourceFileCache.invalidate(new Set([normalizedBasePath]));
++                        pendingTemplateInvalidations.add(normalizedBasePath);
++                    }
++                }
++            },
+             resolveId(id, importer) {
+                 if (jit && id.startsWith('angular:jit:')) {
+                     const path = id.split(';')[1];
+@@ -624,12 +657,23 @@ export function angular(options) {
+         }
+         const isProd = config.mode === 'production';
+         const modifiedFiles = new Set(ids ?? []);
++        // Include any TS files that need recompilation due to HTML template changes
++        if (pendingTemplateInvalidations.size > 0) {
++            for (const tsPath of pendingTemplateInvalidations) {
++                modifiedFiles.add(tsPath);
++            }
++            pendingTemplateInvalidations.clear();
++        }
+         sourceFileCache.invalidate(modifiedFiles);
+         if (ids?.length) {
+             for (const id of ids || []) {
+                 fileTransformMap.delete(id);
+             }
+         }
++        // Also delete fileTransformMap entries for the pending invalidations
++        for (const tsPath of modifiedFiles) {
++            fileTransformMap.delete(tsPath);
++        }
+         // Cached include discovery (invalidated only on FS events)
+         if (pluginOptions.include.length > 0 && includeCache.length === 0) {
+             includeCache = findIncludes();
