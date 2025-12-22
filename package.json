@@ -36,8 +36,8 @@
   "scripts": {
     "dev:ios": "concurrently -k -n vite,ns 'npm run dev:server:ios' 'wait-on tcp:5173 && npm run ios'",
     "dev:android": "concurrently -k -n vite,ns 'npm run dev:server:android' 'wait-on tcp:5173 && npm run android'",
-    "dev:server:ios": "VITE_DEBUG_LOGS=1 vite serve -- --env.ios --env.hmr",
-    "dev:server:android": "VITE_DEBUG_LOGS=1 vite serve -- --env.android --env.hmr",
+    "dev:server:ios": "NS_STRICT_NG_LINK_ALL=1 VITE_DEBUG_LOGS=1 vite serve -- --env.ios --env.hmr",
+    "dev:server:android": "NS_STRICT_NG_LINK_ALL=1 VITE_DEBUG_LOGS=1 vite serve -- --env.android --env.hmr",
     "ios": "VITE_DEBUG_LOGS=1 ns debug ios",
     "android": "VITE_DEBUG_LOGS=1 ns debug android",
     "postinstall": "patch-package"

@@ -1,5 +1,5 @@
 diff --git a/node_modules/@nativescript/vite/configuration/angular.js b/node_modules/@nativescript/vite/configuration/angular.js
-index 723c0b2..61e4097 100644
+index 723c0b2..c47e63d 100644
 --- a/node_modules/@nativescript/vite/configuration/angular.js
 +++ b/node_modules/@nativescript/vite/configuration/angular.js
 @@ -1,5 +1,6 @@
@@ -79,11 +79,89 @@ index 723c0b2..61e4097 100644
      }),
      // Post-phase linker to catch any declarations introduced after other transforms (including project code)
      angularLinkerVitePluginPost(process.cwd()),
+@@ -192,17 +234,24 @@ export const angularConfig = ({ mode }) => {
+         apply: 'build',
+         enforce: 'post',
+         async generateBundle(_options, bundle) {
++            const debug = process.env.VITE_DEBUG_LOGS === '1' || process.env.VITE_DEBUG_LOGS === 'true';
++            if (debug) {
++                console.log('[ns-angular-linker-post] generateBundle called with', Object.keys(bundle).length, 'files');
++            }
+             function isNsAngularPolyfillsChunk(chunk) {
+                 if (!chunk || !chunk.modules)
+                     return false;
+                 return Object.keys(chunk.modules).some((m) => m.includes('node_modules/@nativescript/angular/fesm2022/nativescript-angular-polyfills.mjs'));
+             }
+             const { babel, linkerPlugin } = await ensureSharedAngularLinker(process.cwd());
+-            if (!babel || !linkerPlugin)
++            if (!babel || !linkerPlugin) {
++                if (debug) {
++                    console.log('[ns-angular-linker-post] babel or linkerPlugin not available');
++                }
+                 return;
++            }
+             const strict = process.env.NS_STRICT_NG_LINK === '1' || process.env.NS_STRICT_NG_LINK === 'true';
+             const enforceStrict = process.env.NS_STRICT_NG_LINK_ENFORCE === '1' || process.env.NS_STRICT_NG_LINK_ENFORCE === 'true';
+-            const debug = process.env.VITE_DEBUG_LOGS === '1' || process.env.VITE_DEBUG_LOGS === 'true';
+             const unlinked = [];
+             for (const [fileName, chunk] of Object.entries(bundle)) {
+                 if (!fileName.endsWith('.mjs') && !fileName.endsWith('.js'))
+@@ -211,6 +260,10 @@ export const angularConfig = ({ mode }) => {
+                     const code = chunk.code;
+                     if (!code)
+                         continue;
++                    const hasNgDeclare = containsRealNgDeclare(code);
++                    if (debug) {
++                        console.log('[ns-angular-linker-post] checking', fileName, 'hasNgDeclare:', hasNgDeclare);
++                    }
+                     const isNsPolyfills = isNsAngularPolyfillsChunk(chunk);
+                     try {
+                         const res = await babel.transformAsync(code, {
+@@ -222,6 +275,10 @@ export const angularConfig = ({ mode }) => {
+                             plugins: [linkerPlugin],
+                         });
+                         const finalCode = res?.code && res.code !== code ? res.code : code;
++                        const stillHasNgDeclare = containsRealNgDeclare(finalCode);
++                        if (debug) {
++                            console.log('[ns-angular-linker-post] after linking', fileName, 'changed:', finalCode !== code, 'stillHasNgDeclare:', stillHasNgDeclare);
++                        }
+                         if (finalCode !== code) {
+                             chunk.code = finalCode;
+                             if (debug) {
+@@ -231,11 +288,14 @@ export const angularConfig = ({ mode }) => {
+                                 catch { }
+                             }
+                         }
+-                        if (strict && !isNsPolyfills && containsRealNgDeclare(finalCode)) {
++                        if (strict && !isNsPolyfills && stillHasNgDeclare) {
+                             unlinked.push(fileName);
+                         }
+                     }
+-                    catch {
++                    catch (err) {
++                        if (debug) {
++                            console.log('[ns-angular-linker-post] error linking', fileName, err);
++                        }
+                         if (strict)
+                             unlinked.push(fileName);
+                     }
 diff --git a/node_modules/@nativescript/vite/configuration/base.js b/node_modules/@nativescript/vite/configuration/base.js
-index 4ba1784..e8d0940 100644
+index 4ba1784..946ea8a 100644
 --- a/node_modules/@nativescript/vite/configuration/base.js
 +++ b/node_modules/@nativescript/vite/configuration/base.js
-@@ -452,7 +452,9 @@ export const baseConfig = ({ mode, flavor }) => {
+@@ -296,7 +296,10 @@ export const baseConfig = ({ mode, flavor }) => {
+             }),
+             // Ensure explicit keep markers are honored
+             preserveImportsPlugin(),
+-            hmrActive
++            // Disable vendor manifest plugin for Angular to avoid duplicate identifier issues
++            // when the Angular linker generates conflicting temporary variables (_c2, etc.)
++            // in the esbuild-bundled vendor output.
++            hmrActive && flavor !== 'angular'
+                 ? vendorManifestPlugin({
+                     projectRoot,
+                     platform,
+@@ -452,7 +455,9 @@ export const baseConfig = ({ mode, flavor }) => {
                          // In HMR, avoid emitting a Rollup vendor chunk on disk. The dev server
                          // serves vendor over HTTP and we separately emit a single ns-vendor.mjs
                          // for Android SBG to scan via the vendorManifestPlugin above.
@@ -94,7 +172,7 @@ index 4ba1784..e8d0940 100644
                              return undefined;
                          }
                          const normalizedId = id.split('?')[0].replace(/\\/g, '/');
-@@ -462,7 +464,8 @@ export const baseConfig = ({ mode, flavor }) => {
+@@ -462,7 +467,8 @@ export const baseConfig = ({ mode, flavor }) => {
                          }
                          if (id.includes('node_modules')) {
                              // Keep common dependencies in the main bundle
@@ -104,3 +182,771 @@ index 4ba1784..e8d0940 100644
                                  return undefined; // Keep in main bundle
                              }
                              return 'vendor';
+diff --git a/node_modules/@nativescript/vite/helpers/angular/angular-linker.js b/node_modules/@nativescript/vite/helpers/angular/angular-linker.js
+index 2314bc5..fb584a1 100644
+--- a/node_modules/@nativescript/vite/helpers/angular/angular-linker.js
++++ b/node_modules/@nativescript/vite/helpers/angular/angular-linker.js
+@@ -160,8 +160,9 @@ export function angularLinkerVitePluginPost(projectRoot) {
+         enforce: 'post',
+         async transform(code, id) {
+             const debug = process.env.VITE_DEBUG_LOGS === 'true' || process.env.VITE_DEBUG_LOGS === '1';
+-            // Only JS/ESM files
+-            if (!/\.(m?js)(\?|$)/.test(id))
++            // JS/ESM files and TypeScript files (after Angular transform, TS files contain JS with partial declarations)
++            // Also match virtual module IDs that may not have extensions
++            if (!/\.(m?js|ts|tsx)(\?|$)/.test(id) && !id.startsWith('\0'))
+                 return null;
+             if (!code || !containsRealNgDeclare(code))
+                 return null;
+diff --git a/node_modules/@nativescript/vite/helpers/angular/shared-linker.js b/node_modules/@nativescript/vite/helpers/angular/shared-linker.js
+index 703ca3e..28103da 100644
+--- a/node_modules/@nativescript/vite/helpers/angular/shared-linker.js
++++ b/node_modules/@nativescript/vite/helpers/angular/shared-linker.js
+@@ -1,19 +1,21 @@
+ import { createRequire } from 'node:module';
+ let sharedBabel = null;
+ let sharedLinkerPlugin = null;
++
+ export async function ensureSharedAngularLinker(projectRoot) {
+     if (sharedBabel && sharedLinkerPlugin) {
+         return { babel: sharedBabel, linkerPlugin: sharedLinkerPlugin };
+     }
+     const req = createRequire(projectRoot ? projectRoot + '/package.json' : import.meta.url);
+     let localBabel = null;
+-    let createLinker = null;
++    let linkerPlugin = null;
+     try {
+         const babelPath = req.resolve('@babel/core');
+         const linkerPath = req.resolve('@angular/compiler-cli/linker/babel');
+         localBabel = (await import(babelPath));
+         const linkerMod = await import(linkerPath);
+-        createLinker = linkerMod.createLinkerPlugin || linkerMod.createEs2015LinkerPlugin || null;
++        // Use the default linker plugin which includes fileSystem and logger
++        linkerPlugin = linkerMod.default;
+     }
+     catch {
+         try {
+@@ -22,18 +24,15 @@ export async function ensureSharedAngularLinker(projectRoot) {
+         catch { }
+         try {
+             const linkerMod = await import('@angular/compiler-cli/linker/babel');
+-            createLinker = linkerMod.createLinkerPlugin || linkerMod.createEs2015LinkerPlugin || null;
++            linkerPlugin = linkerMod.default;
+         }
+         catch { }
+     }
+-    if (!localBabel || !createLinker) {
++    if (!localBabel || !linkerPlugin) {
+         return { babel: null, linkerPlugin: null };
+     }
+     sharedBabel = localBabel;
+-    sharedLinkerPlugin = createLinker({
+-        sourceMapping: false,
+-        linkPartialDeclaration: true,
+-    });
++    sharedLinkerPlugin = linkerPlugin;
+     return { babel: sharedBabel, linkerPlugin: sharedLinkerPlugin };
+ }
+ //# sourceMappingURL=shared-linker.js.map
+\ No newline at end of file
+diff --git a/node_modules/@nativescript/vite/helpers/main-entry.js b/node_modules/@nativescript/vite/helpers/main-entry.js
+index 8e262b9..2dce695 100644
+--- a/node_modules/@nativescript/vite/helpers/main-entry.js
++++ b/node_modules/@nativescript/vite/helpers/main-entry.js
+@@ -73,15 +73,19 @@ export function mainEntryPlugin(opts) {
+                 imports += `globalThis.__VISIONOS__ = ${opts.platform === 'visionos' ? 'true' : 'false'};\n`;
+                 imports += `globalThis.__APPLE__ = ${opts.platform === 'ios' || opts.platform === 'visionos' ? 'true' : 'false'};\n`;
+                 // ---- Vendor manifest bootstrap ----
+-                // Use single self-contained vendor module to avoid extra imports affecting chunking
+-                imports += "import vendorManifest, { __nsVendorModuleMap } from '@nativescript/vendor';\n";
+-                imports += "import { installVendorBootstrap } from '@nativescript/vite/hmr/shared/runtime/vendor-bootstrap.js';\n";
+-                if (opts.verbose) {
+-                    imports += `console.info('[ns-entry] vendor manifest imported', { keys: Object.keys(vendorManifest||{}).length, hasMap: typeof __nsVendorModuleMap === 'object' });\n`;
+-                }
+-                imports += 'installVendorBootstrap(vendorManifest, __nsVendorModuleMap, __nsVerboseLog);\n';
+-                if (opts.verbose) {
+-                    imports += `console.info('[ns-entry] vendor bootstrap installed');\n`;
++                // Skip vendor bootstrap for Angular to avoid duplicate identifier issues in vendor bundle
++                // Angular HMR will serve modules directly via HTTP without pre-bundled vendor.
++                if (flavor !== 'angular') {
++                    // Use single self-contained vendor module to avoid extra imports affecting chunking
++                    imports += "import vendorManifest, { __nsVendorModuleMap } from '@nativescript/vendor';\n";
++                    imports += "import { installVendorBootstrap } from '@nativescript/vite/hmr/shared/runtime/vendor-bootstrap.js';\n";
++                    if (opts.verbose) {
++                        imports += `console.info('[ns-entry] vendor manifest imported', { keys: Object.keys(vendorManifest||{}).length, hasMap: typeof __nsVendorModuleMap === 'object' });\n`;
++                    }
++                    imports += 'installVendorBootstrap(vendorManifest, __nsVendorModuleMap, __nsVerboseLog);\n';
++                    if (opts.verbose) {
++                        imports += `console.info('[ns-entry] vendor bootstrap installed');\n`;
++                    }
+                 }
+             }
+             // ---- Core runtime globals (always-needed) ----
+@@ -98,6 +102,28 @@ export function mainEntryPlugin(opts) {
+              */
+             imports += "import { installCoreAliasesEarly } from '@nativescript/vite/runtime/core-aliases-early.js';\n";
+             imports += 'installCoreAliasesEarly(__nsVerboseLog);\n';
++            // ---- Angular runtime exposure for HMR HTTP boot ----
++            // When using Angular with HMR, HTTP-loaded modules need access to Angular's
++            // runtime functions (like ɵɵdefineInjectable). Since Angular is bundled inline,
++            // we expose its exports on globalThis so the /ns/angular bridge can access them.
++            if (opts.hmrActive && flavor === 'angular') {
++                imports += "import * as __AngularCore from '@angular/core';\n";
++                imports += "import * as __AngularCommon from '@angular/common';\n";
++                imports += "import * as __AngularCommonHttp from '@angular/common/http';\n";
++                imports += "import * as __AngularRouter from '@angular/router';\n";
++                imports += "import * as __AngularForms from '@angular/forms';\n";
++                imports += "import * as __NativeScriptAngular from '@nativescript/angular';\n";
++                imports += "(globalThis.__nsAngularModules = globalThis.__nsAngularModules || {});\n";
++                imports += "globalThis.__nsAngularModules['@angular/core'] = __AngularCore;\n";
++                imports += "globalThis.__nsAngularModules['@angular/common'] = __AngularCommon;\n";
++                imports += "globalThis.__nsAngularModules['@angular/common/http'] = __AngularCommonHttp;\n";
++                imports += "globalThis.__nsAngularModules['@angular/router'] = __AngularRouter;\n";
++                imports += "globalThis.__nsAngularModules['@angular/forms'] = __AngularForms;\n";
++                imports += "globalThis.__nsAngularModules['@nativescript/angular'] = __NativeScriptAngular;\n";
++                if (opts.verbose) {
++                    imports += `console.info('[ns-entry] Angular modules exposed on globalThis for HMR');\n`;
++                }
++            }
+             if (opts.hmrActive) {
+                 // Placeholder root for HMR to show prior to http loaded es modules take over
+                 if (opts.verbose) {
+@@ -211,7 +237,10 @@ export function mainEntryPlugin(opts) {
+                 }
+             }
+             // ---- Application main entry ----
+-            if (opts.hmrActive) {
++            // HTTP boot is now supported for Angular via the /ns/angular bridge.
++            // Angular modules are linked in the main bundle and served via HTTP proxy.
++            const useHttpBoot = opts.hmrActive;
++            if (useHttpBoot) {
+                 // HTTP-only dev boot: try to import the entire app over HTTP; if not reachable, keep retrying.
+                 if (opts.verbose) {
+                     imports += `console.info('[ns-entry] including HTTP-only boot', { platform: ${JSON.stringify(opts.platform)}, mainRel: ${JSON.stringify(mainEntryRelPosix)} });\n`;
+@@ -251,8 +280,9 @@ export function mainEntryPlugin(opts) {
+                 }
+                 imports += `import '${mainEntry}';\n`;
+             }
+-            if (opts.isDevMode) {
+-                // debug tools support
++            if (opts.isDevMode && !opts.hmrActive) {
++                // debug tools support (skip when HMR is active - inspector_modules imports
++                // source-map-js which is CommonJS and causes Vite dev server issues)
+                 imports += "import '@nativescript/core/inspector_modules';\n";
+                 if (opts.verbose) {
+                     imports += "console.info('[ns-entry] inspector modules imported');\n";
+diff --git a/node_modules/@nativescript/vite/hmr/server/websocket.js b/node_modules/@nativescript/vite/hmr/server/websocket.js
+index bdc2bf5..bfb904f 100644
+--- a/node_modules/@nativescript/vite/hmr/server/websocket.js
++++ b/node_modules/@nativescript/vite/hmr/server/websocket.js
+@@ -82,7 +82,11 @@ function isNativeScriptCoreModule(spec) {
+     return /^(?:@nativescript[\/_-]core|@nativescript\/core)(?:\b|\/)/i.test(spec || '');
+ }
+ function isNativeScriptPluginModule(spec) {
+-    return /^@nativescript\//i.test(spec || '') && !isNativeScriptCoreModule(spec || '');
++    return /^@nativescript\//i.test(spec || '') && !isNativeScriptCoreModule(spec || '') && !isNativeScriptAngularModule(spec || '');
++}
++// Detect @nativescript/angular and related Angular packages for HTTP bridge routing
++function isNativeScriptAngularModule(spec) {
++    return /^(?:@nativescript\/angular|@angular\/)(?:\b|\/)/i.test(spec || '');
+ }
+ // Looser detector for NativeScript plugin-style specifiers that should be resolved
+ // via device require() rather than HTTP during HMR. This includes popular community
+@@ -109,6 +113,11 @@ function isLikelyNativeScriptPluginSpecifier(spec) {
+         return false;
+     if (/^(?:vue|nativescript-vue)(?:\b|\/)/i.test(s))
+         return false;
++    // Exclude Angular packages which are handled by the /ns/angular bridge
++    if (/^@nativescript\/angular(\b|\/)/i.test(s))
++        return false;
++    if (/^@angular\//.test(s))
++        return false;
+     // Treat any other bare package id as device-resolved (require) during HMR
+     return true;
+ }
+@@ -1328,6 +1337,51 @@ function processCodeForDevice(code, isVitePreBundled) {
+         }
+     }
+     catch { }
++    // Normalize @nativescript/angular and @angular/* imports to the /ns/angular bridge
++    try {
++        // Rewrite @nativescript/angular imports
++        result = result.replace(/from\s+["']@nativescript\/angular([^"'\n]*)["']/g, (_m, sub) => {
++            const qp = (sub || '').trim().replace(/^\//, '');
++            return `from "/ns/angular${qp ? `?p=${qp}` : ''}"`;
++        });
++        result = result.replace(/import\(\s*["']@nativescript\/angular([^"'\n]*)["']\s*\)/g, (_m, sub) => {
++            const qp = (sub || '').trim().replace(/^\//, '');
++            return `import("/ns/angular${qp ? `?p=${qp}` : ''}")`;
++        });
++        // Rewrite @angular/* imports (core, common, forms, router, etc.)
++        result = result.replace(/from\s+["'](@angular\/[^"'\n]+)["']/g, (_m, fullSpec) => {
++            return `from "/ns/angular?p=${encodeURIComponent(fullSpec)}"`;
++        });
++        result = result.replace(/import\(\s*["'](@angular\/[^"'\n]+)["']\s*\)/g, (_m, fullSpec) => {
++            return `import("/ns/angular?p=${encodeURIComponent(fullSpec)}")`;
++        });
++        // Rewrite named imports from /ns/angular bridge into default import + destructuring
++        {
++            let __angular_ns_seq = 0;
++            const toDestructureAngular = (specList) => specList
++                .split(',')
++                .map((s) => s.trim())
++                .filter(Boolean)
++                .map((seg) => {
++                const m = seg.split(/\s+as\s+/i);
++                return m.length === 2 ? `${m[0].trim()}: ${m[1].trim()}` : seg;
++            })
++                .join(', ');
++            const reNamed = /(^|\n)\s*import\s*\{([^}]+)\}\s*from\s*["']((?:https?:\/\/[^"']+)?\/ns\/angular(?:\/[\d]+)?(?:\?p=[^"']+)?)['"];?\s*/gm;
++            result = result.replace(reNamed, (_full, pfx, specList, src) => {
++                __angular_ns_seq++;
++                const tmp = `__ns_angular_ns${__angular_ns_seq}`;
++                const decl = `const { ${toDestructureAngular(specList)} } = ${tmp};`;
++                return `${pfx}import ${tmp} from ${JSON.stringify(src)};\n${decl}\n`;
++            });
++            const reMixed = /(^|\n)\s*import\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]+)\}\s*from\s*["']((?:https?:\/\/[^"']+)?\/ns\/angular(?:\/[\d]+)?(?:\?p=[^"']+)?)['"];?\s*/gm;
++            result = result.replace(reMixed, (_full, pfx, defName, specList, src) => {
++                const decl = `const { ${toDestructureAngular(specList)} } = ${defName};`;
++                return `${pfx}import ${defName} from ${JSON.stringify(src)};\n${decl}\n`;
++            });
++        }
++    }
++    catch { }
+     // Note: Removed legacy var-based underscore prelude to avoid const/var redeclaration conflicts.
+     // Normalize concatenated imports that may have ended up after a statement on the same line
+     try {
+@@ -1689,6 +1743,12 @@ function rewriteImports(code, importerPath, sfcFileMap, depFileMap, projectRoot,
+     let result = code;
+     const httpOriginSafe = httpOrigin;
+     const importerDir = path.posix.dirname(importerPath);
++    // DEBUG: Log Angular imports found in input
++    if (/@nativescript\/angular|@angular\//.test(code)) {
++        console.log('[rewriteImports] INPUT contains Angular imports for:', importerPath);
++        const angularLines = code.split('\n').filter(l => /@nativescript\/angular|@angular\//.test(l)).slice(0, 3);
++        console.log('[rewriteImports] Sample Angular import lines:', angularLines);
++    }
+     // Determine importer output relative path (project-relative .mjs) to compute relative imports consistently
+     const importerOutRel = outputDirOverrideRel || getProjectRelativeImportPath(importerPath, projectRoot) || stripToProjectRelative(importerPath, projectRoot).replace(/\.(ts|js|tsx|jsx|mjs|mts|cts)$/i, '.mjs');
+     const importerOutDir = importerOutRel ? path.posix.dirname(importerOutRel) : '';
+@@ -1746,6 +1806,105 @@ function rewriteImports(code, importerPath, sfcFileMap, depFileMap, projectRoot,
+         });
+     }
+     catch { }
++    // Normalize all @nativescript/angular and @angular/* imports to the unified HTTP ESM Angular bridge
++    try {
++        const hasAngularImport = /@nativescript\/angular|@angular\/|\/node_modules\/@nativescript\/angular|\/node_modules\/@angular\//.test(result);
++        if (hasAngularImport) {
++            console.log('[rewriteImports] Found Angular imports, rewriting...');
++        }
++        let angularAliasIdx = 0;
++        const mkAngularAlias = () => `__NSA${angularAliasIdx++}`;
++        const angularUrl = (sub) => {
++            const p = (sub || '').replace(/^\//, '');
++            return `${httpOriginSafe || ''}/ns/angular` + (p ? `?p=${encodeURIComponent(p)}` : '');
++        };
++        const angularFullUrl = (fullSpec) => {
++            // Strip /node_modules/ prefix if present
++            const cleaned = fullSpec.replace(/^\/node_modules\//, '');
++            return `${httpOriginSafe || ''}/ns/angular?p=${encodeURIComponent(cleaned)}`;
++        };
++        // Match both bare specifiers (@nativescript/angular) and resolved paths (/node_modules/@nativescript/angular)
++        const nsAngularPattern = /(?:\/node_modules\/)?@nativescript\/angular/;
++        const angularPattern = /(?:\/node_modules\/)?@angular\//;
++        // Case 1: import { A, B } from '@nativescript/angular[/sub]' or '/node_modules/@nativescript/angular[/sub]'
++        result = result.replace(/(^|\n)\s*import\s*\{\s*([^}]+?)\s*\}\s*from\s+["'](?:\/node_modules\/)?@nativescript\/angular([^"'\n]*)["'];?/g, (_m, pfx, names, sub) => {
++            console.log('[rewriteImports] Rewriting @nativescript/angular import:', sub);
++            const alias = mkAngularAlias();
++            const url = angularUrl(sub || '');
++            const cleaned = names
++                .split(',')
++                .map((s) => s.trim())
++                .filter(Boolean)
++                .join(', ');
++            return `${pfx}import * as ${alias} from ${JSON.stringify(url)};\nconst { ${cleaned} } = ${alias};`;
++        });
++        // Case 2: import Default, { A, B } from '@nativescript/angular[/sub]'
++        result = result.replace(/(^|\n)\s*import\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]+?)\s*\}\s*from\s*["'](?:\/node_modules\/)?@nativescript\/angular([^"'\n]*)["'];?/g, (_m, pfx, defName, names, sub) => {
++            const alias = mkAngularAlias();
++            const url = angularUrl(sub || '');
++            const cleaned = names
++                .split(',')
++                .map((s) => s.trim())
++                .filter(Boolean)
++                .join(', ');
++            return `${pfx}import * as ${alias} from ${JSON.stringify(url)};\nconst ${defName} = (${alias}.default || ${alias});\nconst { ${cleaned} } = ${alias};`;
++        });
++        // Case 3: import Default from '@nativescript/angular[/sub]'
++        result = result.replace(/(^|\n)\s*import\s+([A-Za-z_$][\w$]*)\s+from\s*["'](?:\/node_modules\/)?@nativescript\/angular([^"'\n]*)["'];?/g, (_m, pfx, defName, sub) => {
++            const alias = mkAngularAlias();
++            const url = angularUrl(sub || '');
++            return `${pfx}import * as ${alias} from ${JSON.stringify(url)};\nconst ${defName} = (${alias}.default || ${alias});`;
++        });
++        // Case 4: import * as NS from '@nativescript/angular[/sub]'
++        result = result.replace(/(^|\n)\s*import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*["'](?:\/node_modules\/)?@nativescript\/angular([^"'\n]*)["'];?/g, (_m, pfx, nsName, sub) => {
++            const url = angularUrl(sub || '');
++            return `${pfx}import * as ${nsName} from ${JSON.stringify(url)};`;
++        });
++        // Case 5: side-effect import '@nativescript/angular[/sub]'
++        result = result.replace(/(^|\n)\s*import\s*["'](?:\/node_modules\/)?@nativescript\/angular([^"'\n]*)["'];?/g, (_m, pfx, sub) => {
++            const url = angularUrl(sub || '');
++            return `${pfx}import ${JSON.stringify(url)};`;
++        });
++        // Case 6: dynamic import('@nativescript/angular[/sub]')
++        result = result.replace(/import\(\s*["'](?:\/node_modules\/)?@nativescript\/angular([^"'\n]*)["']\s*\)/g, (_m, sub) => {
++            const url = angularUrl(sub || '');
++            return `import(${JSON.stringify(url)})`;
++        });
++        // Now handle @angular/* imports (core, common, forms, router, platform-browser, etc.)
++        // Case 7: import { A, B } from '@angular/xxx' or '/node_modules/@angular/xxx'
++        result = result.replace(/(^|\n)\s*import\s*\{\s*([^}]+?)\s*\}\s*from\s+["'](?:\/node_modules\/)?(@angular\/[^"'\n]+)["'];?/g, (_m, pfx, names, fullSpec) => {
++            const alias = mkAngularAlias();
++            const url = angularFullUrl(fullSpec);
++            const cleaned = names
++                .split(',')
++                .map((s) => s.trim())
++                .filter(Boolean)
++                .join(', ');
++            return `${pfx}import * as ${alias} from ${JSON.stringify(url)};\nconst { ${cleaned} } = ${alias};`;
++        });
++        // Case 8: import Default from '@angular/xxx'
++        result = result.replace(/(^|\n)\s*import\s+([A-Za-z_$][\w$]*)\s+from\s*["'](?:\/node_modules\/)?(@angular\/[^"'\n]+)["'];?/g, (_m, pfx, defName, fullSpec) => {
++            const alias = mkAngularAlias();
++            const url = angularFullUrl(fullSpec);
++            return `${pfx}import * as ${alias} from ${JSON.stringify(url)};\nconst ${defName} = (${alias}.default || ${alias});`;
++        });
++        // Case 9: import * as NS from '@angular/xxx'
++        result = result.replace(/(^|\n)\s*import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s*["'](?:\/node_modules\/)?(@angular\/[^"'\n]+)["'];?/g, (_m, pfx, nsName, fullSpec) => {
++            const url = angularFullUrl(fullSpec);
++            return `${pfx}import * as ${nsName} from ${JSON.stringify(url)};`;
++        });
++        // Case 10: side-effect import '@angular/xxx'
++        result = result.replace(/(^|\n)\s*import\s*["'](?:\/node_modules\/)?(@angular\/[^"'\n]+)["'];?/g, (_m, pfx, fullSpec) => {
++            const url = angularFullUrl(fullSpec);
++            return `${pfx}import ${JSON.stringify(url)};`;
++        });
++        // Case 11: dynamic import('@angular/xxx')
++        result = result.replace(/import\(\s*["'](?:\/node_modules\/)?(@angular\/[^"'\n]+)["']\s*\)/g, (_m, fullSpec) => {
++            const url = angularFullUrl(fullSpec);
++            return `import(${JSON.stringify(url)})`;
++        });
++    }
++    catch { }
+     // Inline JSON imports (package.json, config.json, etc.)
+     // This must happen BEFORE other rewrites because JSON imports get a ?import query added by Vite
+     result = result.replace(/import\s+(\w+)\s+from\s+["']([^"']+\.json(?:\?[^"']*)?)["'];?/g, (match, varName, jsonPath) => {
+@@ -2381,6 +2540,31 @@ function createHmrWebSocketPlugin(opts) {
+                 }
+                 catch { }
+             });
++            // EARLY MIDDLEWARE: Intercept source-map-js requests and return a stub
++            // source-map-js is a CommonJS module that causes Vite's transform pipeline to fail.
++            // It's already bundled into the main bundle, so we return a no-op export here.
++            server.middlewares.use(async (req, res, next) => {
++                try {
++                    const urlObj = new URL(req.url || '', 'http://localhost');
++                    if (urlObj.pathname.includes('source-map-js') || urlObj.pathname.includes('source-map.js')) {
++                        res.setHeader('Access-Control-Allow-Origin', '*');
++                        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
++                        res.setHeader('Cache-Control', 'no-store');
++                        // Return a stub module - source-map-js is bundled and shouldn't be HTTP-loaded
++                        const stubCode = `// [ns-hmr] source-map-js stub - module is bundled, not HTTP-served
++export const SourceMapConsumer = class {};
++export const SourceMapGenerator = class {};
++export const SourceNode = class {};
++export default { SourceMapConsumer, SourceMapGenerator, SourceNode };
++`;
++                        res.statusCode = 200;
++                        res.end(stubCode);
++                        return;
++                    }
++                }
++                catch {}
++                next();
++            });
+             // Dev-only HTTP ESM loader endpoint for device clients
+             // 1) Legacy JSON module endpoint (kept temporarily): GET /ns-module?path=/abs -> { path, code, additionalFiles }
+             server.middlewares.use(async (req, res, next) => {
+@@ -3264,14 +3448,380 @@ export const piniaSymbol = p.piniaSymbol;
+                     const key = sub ? `@nativescript/core/${sub}` : `@nativescript/core`;
+                     // HTTP-only core bridge: do NOT use require/createRequire. Export a proxy that maps
+                     // property access to globalThis first, then to any available vendor registry module.
++                    // Known core exports that need named export wrappers
++                    const KNOWN_CORE_EXPORTS = [
++                        // Application & Utils
++                        'Application', 'Utils', 'Device', 'Screen', 'isAndroid', 'isIOS',
++                        // UI Views
++                        'View', 'ViewBase', 'ContainerView', 'CustomLayoutView', 'LayoutBase',
++                        'Frame', 'Page', 'ContentView', 'RootLayout',
++                        // Layouts
++                        'AbsoluteLayout', 'DockLayout', 'FlexboxLayout', 'GridLayout',
++                        'StackLayout', 'WrapLayout',
++                        // Basic Views
++                        'Label', 'Button', 'TextField', 'TextView', 'Image', 'ScrollView',
++                        'ListView', 'WebView', 'HtmlView', 'Placeholder', 'ProxyViewContainer',
++                        // Form controls
++                        'Switch', 'Slider', 'Progress', 'ActivityIndicator', 'DatePicker',
++                        'TimePicker', 'ListPicker', 'SearchBar', 'SegmentedBar', 'SegmentedBarItem',
++                        // Navigation
++                        'ActionBar', 'ActionItem', 'NavigationButton', 'TabView', 'TabViewItem',
++                        'BottomNavigation', 'Tabs', 'TabStrip', 'TabStripItem', 'TabContentItem',
++                        // Text
++                        'FormattedString', 'Span',
++                        // Observable & Binding
++                        'Observable', 'ObservableArray', 'fromObject', 'fromObjectRecursive',
++                        'PropertyChangeData', 'EventData', 'WrappedValue',
++                        // Color & Styling  
++                        'Color', 'Style', 'CssProperty', 'Property', 'InheritedProperty',
++                        // File & Http
++                        'File', 'Folder', 'FileSystemEntity', 'path', 'knownFolders',
++                        'Http', 'HttpResponse', 'HttpRequestOptions',
++                        // Image & Assets
++                        'ImageSource', 'ImageAsset', 'ImageCache',
++                        // Gestures
++                        'GestureTypes', 'GesturesObserver', 'TouchAction', 'SwipeDirection',
++                        // Accessibility
++                        'AccessibilityRole', 'AccessibilityState', 'AccessibilityLiveRegion',
++                        // Dialogs
++                        'Dialogs', 'alert', 'confirm', 'prompt', 'login', 'action',
++                        // Animations
++                        'Animation', 'AnimationDefinition', 'KeyframeAnimation',
++                        // Platform specifics
++                        'Trace', 'profile', 'time', 'uptime',
++                        // Timers
++                        'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
++                        // Connectivity
++                        'Connectivity', 'connectionType',
++                        // Misc
++                        'encoding', 'XmlParser', 'Builder', 'Template', 'KeyedTemplate',
++                        // SplitView (iPad specific)
++                        'SplitView'
++                    ];
+                     let code = REQUIRE_GUARD_SNIPPET +
+-                        `// [ns-core-bridge][v${ver}] HTTP-only ESM bridge (default proxy only)\n` +
++                        `// [ns-core-bridge][v${ver}] HTTP-only ESM bridge with named exports\n` +
+                         `const g = globalThis;\n` +
+                         `const reg = (g.__nsVendorRegistry ||= new Map());\n` +
+-                        `const __getVendorCore = () => { try { const m = reg && reg.get ? (reg.get(${JSON.stringify(key)}) || reg.get('@nativescript/core')) : null; return (m && (m.__esModule && m.default ? m.default : (m.default || m))) || m || null; } catch { return null; } };\n` +
++                        `const __getVendorCore = () => {\n` +
++                        `  try {\n` +
++                        `    // Try vendor registry first\n` +
++                        `    if (reg && reg.get) {\n` +
++                        `      const m = reg.get(${JSON.stringify(key)}) || reg.get('@nativescript/core') || reg.get('@nativescript/core/ui');\n` +
++                        `      if (m) return (m.__esModule && m.default ? m.default : (m.default || m)) || m;\n` +
++                        `    }\n` +
++                        `    // Try global.loadModule (registered via global.registerModule)\n` +
++                        `    if (typeof g.loadModule === 'function') {\n` +
++                        `      try { const m = g.loadModule('@nativescript/core/ui'); if (m) return m; } catch {}\n` +
++                        `    }\n` +
++                        `  } catch {}\n` +
++                        `  return null;\n` +
++                        `};\n` +
++                        `// Create a lazy proxy for a specific export that defers all property access\n` +
++                        `const __lazyExport = (name) => {\n` +
++                        `  let _cached = null;\n` +
++                        `  const _get = () => {\n` +
++                        `    if (_cached) return _cached;\n` +
++                        `    try { if (g[name] !== undefined) { _cached = g[name]; return _cached; } } catch {}\n` +
++                        `    try { const vc = __getVendorCore(); if (vc && vc[name]) { _cached = vc[name]; return _cached; } } catch {}\n` +
++                        `    return undefined;\n` +
++                        `  };\n` +
++                        `  // Return a proxy that looks like a class - can be called with new, and property access works\n` +
++                        `  return new Proxy(function(){}, {\n` +
++                        `    get(_, p) { const real = _get(); return real ? real[p] : undefined; },\n` +
++                        `    set(_, p, v) { const real = _get(); if (real) { real[p] = v; return true; } return false; },\n` +
++                        `    construct(_, args) { const real = _get(); if (typeof real === 'function') return new real(...args); throw new Error(name + ' is not a constructor'); },\n` +
++                        `    apply(_, thisArg, args) { const real = _get(); if (typeof real === 'function') return real.apply(thisArg, args); throw new Error(name + ' is not callable'); }\n` +
++                        `  });\n` +
++                        `};\n` +
+                         `const __core = new Proxy({}, { get(_t, p){ if (p === 'default') return __core; if (p === Symbol.toStringTag) return 'Module'; try { const v = g[p]; if (v !== undefined) return v; } catch {} try { const vc = __getVendorCore(); return vc ? vc[p] : undefined; } catch {} return undefined; } });\n` +
+                         `// Default export: namespace-like proxy\n` +
+                         `export default __core;\n`;
++                    // Add named exports for known core exports 
++                    // Use lazy proxy pattern that defers resolution until actual property access
++                    code += `// Named exports - lazy proxies that defer to vendor registry on access\n`;
++                    for (const name of KNOWN_CORE_EXPORTS) {
++                        // Use lazy proxy for each export
++                        code += `export const ${name} = __lazyExport('${name}');\n`;
++                    }
++                    res.statusCode = 200;
++                    res.end(code);
++                }
++                catch (e) {
++                    next();
++                }
++            });
++            // Cache of Angular package exports for dynamic re-export generation
++            const __angularExportsCache = new Map();
++            // Known exports for packages that can't be loaded via createRequire due to ESM issues
++            const KNOWN_ANGULAR_EXPORTS = {
++                '@nativescript/angular': [
++                    'runNativeScriptAngularApp', 'bootstrapApplication', 'provideNativeScriptHttpClient',
++                    'provideNativeScriptRouter', 'NativeScriptModule', 'NativeScriptCommonModule',
++                    'NativeScriptFormsModule', 'NativeScriptRouterModule', 'NativeScriptHttpClientModule',
++                    'RouterExtensions', 'NSRouterLink', 'NSEmptyOutletComponent', 'PageRouterOutlet',
++                    'FrameService', 'Page', 'Frame', 'registerElement', 'ViewResolver',
++                    'DetachedLoader', 'AppHostView', 'AppHostAsyncView', 'GridLayout',
++                    'StackLayout', 'WrapLayout', 'FlexboxLayout', 'AbsoluteLayout', 'DockLayout',
++                    'Button', 'Label', 'TextField', 'TextView', 'Image', 'ListView', 'ScrollView',
++                    'ActionBar', 'ActionItem', 'NavigationButton', 'TabView', 'TabViewItem',
++                    'Placeholder', 'ProxyViewContainer', 'ContentView', 'WebView', 'HtmlView',
++                    'ListPicker', 'DatePicker', 'TimePicker', 'Slider', 'Switch', 'Progress',
++                    'ActivityIndicator', 'SearchBar', 'SegmentedBar', 'SegmentedBarItem',
++                    'FormattedString', 'Span', 'Repeater', 'BottomNavigation', 'TabContentItem',
++                    'TabStrip', 'TabStripItem', 'Tabs', 'RootLayout'
++                ],
++                '@angular/core': [
++                    'Component', 'Directive', 'Injectable', 'NgModule', 'Pipe', 'Input', 'Output',
++                    'EventEmitter', 'ViewChild', 'ViewChildren', 'ContentChild', 'ContentChildren',
++                    'HostListener', 'HostBinding', 'Inject', 'Optional', 'Self', 'SkipSelf', 'Host',
++                    'forwardRef', 'Injector', 'ReflectiveInjector', 'Provider', 'Type',
++                    'ChangeDetectorRef', 'ChangeDetectionStrategy', 'NgZone', 'ApplicationRef',
++                    'ElementRef', 'TemplateRef', 'ViewContainerRef', 'Renderer2', 'RendererFactory2',
++                    'ComponentFactoryResolver', 'ComponentRef', 'EmbeddedViewRef', 'ViewRef',
++                    'OnInit', 'OnDestroy', 'OnChanges', 'AfterViewInit', 'AfterContentInit',
++                    'DoCheck', 'AfterViewChecked', 'AfterContentChecked', 'SimpleChanges',
++                    'PLATFORM_ID', 'Attribute', 'Query', 'signal', 'computed', 'effect',
++                    'inject', 'provideZonelessChangeDetection', 'isSignal', 'untracked',
++                    'ɵɵdefineInjectable', 'ɵɵdefineComponent', 'ɵɵdefineDirective', 'ɵɵdefineNgModule',
++                    'ɵɵdefinePipe', 'ɵsetClassDebugInfo', 'ɵɵelementStart', 'ɵɵelementEnd',
++                    'ɵɵelement', 'ɵɵtext', 'ɵɵtemplate', 'ɵɵproperty', 'ɵɵadvance',
++                    'ɵɵlistener', 'ɵɵpipe', 'ɵɵpipeBind1', 'ɵɵpipeBind2', 'ɵɵpipeBindV',
++                    'ɵɵdirectiveInject', 'ɵɵgetCurrentView', 'ɵɵrestoreView', 'ɵɵresetView',
++                    'ɵɵnextContext', 'ɵɵreference', 'ɵɵprojection', 'ɵɵprojectionDef',
++                    'ɵɵNgOnChangesFeature', 'ɵɵProvidersFeature', 'ɵɵHostDirectivesFeature',
++                    'ɵɵInputTransformsFeature', 'ɵɵInheritDefinitionFeature', 'ɵɵCopyDefinitionFeature',
++                    'ɵɵStandaloneFeature', 'VERSION', 'LOCALE_ID', 'DEFAULT_CURRENCY_CODE',
++                    'APP_INITIALIZER', 'APP_BOOTSTRAP_LISTENER', 'ENVIRONMENT_INITIALIZER'
++                ],
++                '@angular/common': [
++                    'CommonModule', 'NgIf', 'NgFor', 'NgForOf', 'NgSwitch', 'NgSwitchCase', 'NgSwitchDefault',
++                    'NgClass', 'NgStyle', 'NgTemplateOutlet', 'NgComponentOutlet', 'NgPlural', 'NgPluralCase',
++                    'AsyncPipe', 'DatePipe', 'UpperCasePipe', 'LowerCasePipe', 'CurrencyPipe', 'DecimalPipe',
++                    'PercentPipe', 'JsonPipe', 'SlicePipe', 'KeyValuePipe', 'TitleCasePipe', 'I18nPluralPipe',
++                    'I18nSelectPipe', 'Location', 'LocationStrategy', 'PathLocationStrategy', 'HashLocationStrategy',
++                    'APP_BASE_HREF', 'PlatformLocation', 'DOCUMENT', 'DatePipeConfig', 'IMAGE_CONFIG',
++                    'formatDate', 'formatNumber', 'formatCurrency', 'formatPercent', 'getCurrencySymbol',
++                    'getLocaleDateFormat', 'getLocaleTimeFormat', 'getLocaleDateTimeFormat',
++                    'registerLocaleData', 'isPlatformBrowser', 'isPlatformServer', 'isPlatformWorkerApp', 'isPlatformWorkerUi'
++                ],
++                '@angular/common/http': [
++                    'HttpClient', 'HttpClientModule', 'HttpHeaders', 'HttpParams', 'HttpRequest', 'HttpResponse',
++                    'HttpErrorResponse', 'HttpEventType', 'HttpInterceptor', 'HTTP_INTERCEPTORS',
++                    'HttpHandler', 'HttpBackend', 'HttpXhrBackend', 'XhrFactory',
++                    'provideHttpClient', 'withInterceptors', 'withInterceptorsFromDi', 'withFetch',
++                    'withJsonpSupport', 'withNoXsrfProtection', 'withXsrfConfiguration', 'withRequestsMadeViaParent',
++                    'HttpClientJsonpModule', 'HttpClientXsrfModule', 'HttpContext', 'HttpContextToken',
++                    'HttpDownloadProgressEvent', 'HttpHeaderResponse', 'HttpProgressEvent',
++                    'HttpSentEvent', 'HttpUploadProgressEvent', 'HttpUrlEncodingCodec', 'HttpParameterCodec'
++                ],
++                '@angular/router': [
++                    'RouterModule', 'RouterOutlet', 'RouterLink', 'RouterLinkActive', 'Router', 'ActivatedRoute',
++                    'ActivatedRouteSnapshot', 'RouterStateSnapshot', 'Routes', 'Route', 'UrlTree', 'UrlSegment',
++                    'UrlSegmentGroup', 'NavigationExtras', 'NavigationStart', 'NavigationEnd', 'NavigationCancel',
++                    'NavigationError', 'RoutesRecognized', 'GuardsCheckStart', 'GuardsCheckEnd',
++                    'ResolveStart', 'ResolveEnd', 'ChildActivationStart', 'ChildActivationEnd',
++                    'ActivationStart', 'ActivationEnd', 'Scroll', 'RouteConfigLoadStart', 'RouteConfigLoadEnd',
++                    'ParamMap', 'convertToParamMap', 'DefaultUrlSerializer', 'UrlSerializer',
++                    'CanActivate', 'CanActivateChild', 'CanDeactivate', 'CanLoad', 'CanMatch', 'Resolve',
++                    'provideRouter', 'withComponentInputBinding', 'withDebugTracing', 'withDisabledInitialNavigation',
++                    'withEnabledBlockingInitialNavigation', 'withHashLocation', 'withInMemoryScrolling',
++                    'withNavigationErrorHandler', 'withPreloading', 'withRouterConfig', 'withViewTransitions',
++                    'ROUTER_CONFIGURATION', 'ROUTES', 'ROUTER_INITIALIZER', 'PreloadAllModules', 'NoPreloading',
++                    'RouterPreloader', 'RouterState', 'ChildrenOutletContexts', 'OutletContext'
++                ],
++                '@angular/forms': [
++                    'FormsModule', 'ReactiveFormsModule', 'FormControl', 'FormGroup', 'FormArray', 'FormBuilder',
++                    'Validators', 'NgForm', 'NgModel', 'NgModelGroup', 'FormControlDirective', 'FormGroupDirective',
++                    'FormControlName', 'FormGroupName', 'FormArrayName', 'AbstractControl', 'AbstractControlDirective',
++                    'ControlContainer', 'ControlValueAccessor', 'DefaultValueAccessor', 'NG_VALUE_ACCESSOR',
++                    'NG_VALIDATORS', 'NG_ASYNC_VALIDATORS', 'ValidationErrors', 'ValidatorFn', 'AsyncValidatorFn',
++                    'CheckboxControlValueAccessor', 'RadioControlValueAccessor', 'SelectControlValueAccessor',
++                    'SelectMultipleControlValueAccessor', 'NumberValueAccessor', 'RangeValueAccessor',
++                    'NgSelectOption', 'MaxLengthValidator', 'MinLengthValidator', 'PatternValidator',
++                    'RequiredValidator', 'EmailValidator', 'MinValidator', 'MaxValidator',
++                    'NonNullableFormBuilder', 'FormRecord', 'UntypedFormControl', 'UntypedFormGroup', 'UntypedFormArray', 'UntypedFormBuilder'
++                ]
++            };
++            const getAngularExports = (packageSpec) => {
++                if (__angularExportsCache.has(packageSpec)) {
++                    return __angularExportsCache.get(packageSpec);
++                }
++                let exports = '';
++                // First try known exports list (works for packages that can't be loaded via createRequire)
++                const knownExports = KNOWN_ANGULAR_EXPORTS[packageSpec];
++                if (knownExports && knownExports.length > 0) {
++                    for (const key of knownExports) {
++                        // Use function wrappers for all exports to ensure lazy evaluation
++                        exports += `export function ${key}(...args) { const fn = __ns.${key}; return typeof fn === 'function' ? fn.apply(this, args) : fn; }\n`;
++                    }
++                    __angularExportsCache.set(packageSpec, exports);
++                    return exports;
++                }
++                // Fallback: try to load dynamically via createRequire
++                try {
++                    const req = createRequire(import.meta.url);
++                    const mod = req(packageSpec);
++                    if (mod) {
++                        const keys = Object.keys(mod).filter(k => /^[a-zA-Z_$ɵ][a-zA-Z0-9_$ɵ]*$/.test(k));
++                        for (const key of keys) {
++                            if (typeof mod[key] === 'function') {
++                                exports += `export function ${key}(...args) { return __ns.${key}(...args); }\n`;
++                            } else {
++                                exports += `export const ${key} = __ns.${key};\n`;
++                            }
++                        }
++                    }
++                } catch (e) {
++                    if (verbose) console.warn('[angular-exports] Failed to get exports for', packageSpec, e.message);
++                }
++                __angularExportsCache.set(packageSpec, exports);
++                return exports;
++            };
++            // 2.6-ng) ESM bridge for @nativescript/angular and @angular/*: GET /ns/angular[/<ver>][?p=sub/path]
++            // Angular modules are pre-linked into the main bundle, so this bridge uses device require()
++            // to access them from the bundle rather than trying to serve them via HTTP.
++            server.middlewares.use(async (req, res, next) => {
++                try {
++                    const urlObj = new URL(req.url || '', 'http://localhost');
++                    if (!(urlObj.pathname === '/ns/angular' || /^\/ns\/angular\/[\d]+$/.test(urlObj.pathname)))
++                        return next();
++                    res.setHeader('Access-Control-Allow-Origin', '*');
++                    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
++                    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
++                    res.setHeader('Pragma', 'no-cache');
++                    res.setHeader('Expires', '0');
++                    const verSeg = urlObj.pathname.replace(/^\/ns\/angular\/?/, '');
++                    const ver = /^[0-9]+$/.test(verSeg) ? verSeg : String(graphVersion || 0);
++                    const sub = urlObj.searchParams.get('p') || '';
++                    // Determine the package specifier: @nativescript/angular or @angular/xxx
++                    // Normalize fesm paths like @angular/core/fesm2022/core.mjs -> @angular/core
++                    // and @angular/common/fesm2022/http.mjs -> @angular/common/http (subpath)
++                    let packageSpec = '@nativescript/angular';
++                    let subPath = '';
++                    if (sub) {
++                        if (sub.startsWith('@angular/')) {
++                            // Parse @angular/xxx/fesm2022/yyy.mjs pattern
++                            const angularMatch = sub.match(/^@angular\/([^\/]+)(\/fesm\d+\/([^\.]+)\.m?js)?/);
++                            if (angularMatch) {
++                                const pkg = angularMatch[1]; // e.g., 'core', 'common'
++                                const entry = angularMatch[3]; // e.g., 'core', 'http'
++                                if (pkg === entry || !entry) {
++                                    // @angular/core/fesm2022/core.mjs -> @angular/core
++                                    packageSpec = `@angular/${pkg}`;
++                                } else {
++                                    // @angular/common/fesm2022/http.mjs -> @angular/common/http
++                                    packageSpec = `@angular/${pkg}`;
++                                    subPath = entry;
++                                }
++                            } else {
++                                packageSpec = sub;
++                            }
++                        } else if (sub.startsWith('angular/')) {
++                            packageSpec = '@' + sub;
++                        } else if (sub.startsWith('fesm')) {
++                            // Parse fesm2022/nativescript-angular[-submodule].mjs pattern
++                            // fesm2022/nativescript-angular.mjs -> @nativescript/angular
++                            // fesm2022/nativescript-angular-polyfills.mjs -> @nativescript/angular/polyfills
++                            // fesm2022/nativescript-angular-testing.mjs -> @nativescript/angular/testing
++                            const fesmMatch = sub.match(/^fesm\d+\/nativescript-angular(?:-([^\.]+))?\.m?js$/);
++                            if (fesmMatch && fesmMatch[1]) {
++                                // Has submodule like 'polyfills' or 'testing'
++                                packageSpec = '@nativescript/angular';
++                                subPath = fesmMatch[1]; // 'polyfills', 'testing', etc.
++                            } else {
++                                // Main entry
++                                packageSpec = '@nativescript/angular';
++                            }
++                        } else if (sub === 'polyfills' || sub === 'testing') {
++                            // Direct submodule import like @nativescript/angular/polyfills
++                            packageSpec = '@nativescript/angular';
++                            subPath = sub;
++                        } else {
++                            packageSpec = '@nativescript/angular/' + sub;
++                        }
++                    }
++                    // SPECIAL CASE: polyfills are side-effect modules that are already executed
++                    // in the main bundle. Return a no-op export to avoid HTTP-loading their dependencies.
++                    if (subPath === 'polyfills') {
++                        const noopCode = REQUIRE_GUARD_SNIPPET +
++                            `// [ns-angular-bridge][v${ver}] @nativescript/angular/polyfills - already loaded in bundle\n` +
++                            `// Polyfills are side-effect modules executed during bundle init.\n` +
++                            `export const nsNgPolyfills = true;\n` +
++                            `export default { nsNgPolyfills: true };\n`;
++                        res.statusCode = 200;
++                        res.end(noopCode);
++                        return;
++                    }
++                    // HTTP-only Angular bridge: Angular modules are linked in the main bundle,
++                    // and exposed on globalThis.__nsAngularModules from main-entry.js
++                    // IMPORTANT: We export the actual module, not a proxy, because Angular's
++                    // AOT code does property access like i0.ɵɵdefineInjectable which must work.
++                    let code = REQUIRE_GUARD_SNIPPET +
++                        `// [ns-angular-bridge][v${ver}] HTTP bridge for Angular modules (spec=${packageSpec}, subPath=${subPath})\n` +
++                        `const g = globalThis;\n` +
++                        `const spec = ${JSON.stringify(packageSpec)};\n` +
++                        `const subPath = ${JSON.stringify(subPath)};\n` +
++                        `let __angularMod = null;\n` +
++                        `// Debug: log what we're looking for\n` +
++                        `console.log('[ns-angular-bridge] Looking for:', spec, subPath ? '/' + subPath : '', 'nsAngularModules keys:', g.__nsAngularModules ? Object.keys(g.__nsAngularModules) : 'NOT SET');\n` +
++                        `// First, try globalThis.__nsAngularModules (set by main-entry for HMR)\n` +
++                        `try {\n` +
++                        `  const nsAng = g.__nsAngularModules;\n` +
++                        `  if (nsAng) {\n` +
++                        `    // Try exact match first (e.g., @angular/common/http)\n` +
++                        `    if (subPath && nsAng[spec + '/' + subPath]) {\n` +
++                        `      __angularMod = nsAng[spec + '/' + subPath];\n` +
++                        `      console.log('[ns-angular-bridge] Found via exact subpath key:', spec + '/' + subPath);\n` +
++                        `    }\n` +
++                        `    // Try base package and access subPath as property (e.g., @angular/common)[http]\n` +
++                        `    else if (nsAng[spec]) {\n` +
++                        `      __angularMod = subPath ? nsAng[spec][subPath] : nsAng[spec];\n` +
++                        `      console.log('[ns-angular-bridge] Found via base spec:', spec, subPath ? 'subPath=' + subPath : '');\n` +
++                        `    }\n` +
++                        `  } else {\n` +
++                        `    console.warn('[ns-angular-bridge] __nsAngularModules not set yet!');\n` +
++                        `  }\n` +
++                        `} catch (e) { console.error('[ns-angular-bridge] Error accessing __nsAngularModules:', e); }\n` +
++                        `// Try vendor registry second (if available)\n` +
++                        `if (!__angularMod) {\n` +
++                        `  try {\n` +
++                        `    const reg = g.__nsVendorRegistry;\n` +
++                        `    if (reg && reg.get) {\n` +
++                        `      const m = reg.get(spec);\n` +
++                        `      if (m) {\n` +
++                        `        __angularMod = m.__esModule && m.default ? m.default : (m.default || m);\n` +
++                        `        console.log('[ns-angular-bridge] Found via vendor registry:', spec);\n` +
++                        `      }\n` +
++                        `    }\n` +
++                        `  } catch {}\n` +
++                        `}\n` +
++                        `// Fallback to device require()\n` +
++                        `if (!__angularMod && typeof g.require === 'function') {\n` +
++                        `  try {\n` +
++                        `    __angularMod = g.require(spec);\n` +
++                        `    if (__angularMod) console.log('[ns-angular-bridge] Found via require():', spec);\n` +
++                        `  } catch {}\n` +
++                        `}\n` +
++                        `// Log final result\n` +
++                        `if (__angularMod) {\n` +
++                        `  const keyCount = Object.keys(__angularMod).length;\n` +
++                        `  const sampleKeys = Object.keys(__angularMod).slice(0,5).join(', ');\n` +
++                        `  console.log('[ns-angular-bridge] SUCCESS for', spec, '- keys:', keyCount, 'sample:', sampleKeys);\n` +
++                        `  if (spec === '@angular/core') {\n` +
++                        `    console.log('[ns-angular-bridge] @angular/core ɵɵdefineInjectable:', typeof __angularMod.ɵɵdefineInjectable, 'ɵsetClassDebugInfo:', typeof __angularMod.ɵsetClassDebugInfo);\n` +
++                        `  }\n` +
++                        `} else {\n` +
++                        `  console.error('[ns-angular-bridge] FAILED - module not found for:', spec);\n` +
++                        `}\n` +
++                        `// Re-export module as default and create a namespace-like export object\n` +
++                        `const __ns = __angularMod || {};\n` +
++                        `export default __ns;\n`;
++                    // Dynamically generate exports for ALL keys in the target package
++                    // This ensures we export all Angular internal symbols like ɵɵdefineInjectable, ɵsetClassDebugInfo, etc.
++                    code += getAngularExports(packageSpec);
++                    if (verbose) {
++                        console.log('[hmr-http] GET /ns/angular', sub ? `?p=${sub}` : '', '->', packageSpec, subPath ? `(subPath: ${subPath})` : '');
++                    }
+                     res.statusCode = 200;
+                     res.end(code);
+                 }

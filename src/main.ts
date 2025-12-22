@@ -11,11 +11,12 @@ import { SPLIT_VIEW_ROUTES } from "./split-view-demo/split-view.routes";
 import { SplitViewDemoComponent } from "./split-view-demo/split-view-demo.component";
 import "./global-setup";
 
-// Set the split style before bootstrapping - 'triple' is needed for primary/supplementary/secondary layout
-SplitView.SplitStyle = "triple";
-
 runNativeScriptAngularApp({
   appModuleBootstrap: () => {
+    // Set the split style before bootstrapping - 'triple' is needed for primary/supplementary/secondary layout
+    // Note: Must be set inside the bootstrap callback for HMR compatibility
+    SplitView.SplitStyle = "triple";
+    
     if (__APPLE__) {
       Utils.ios.setWindowBackgroundColor("red");
     }
